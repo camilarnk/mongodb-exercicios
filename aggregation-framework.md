@@ -61,7 +61,7 @@ db.visualizacoes.aggregate([
   {
     $match: {
       dispositivo: "web",
-      minutosAssistidos: { $gt: 60 },
+      minutosAssistidos: { $gte: 60 },
       dataHora: {
         $gte: new Date("2026-04-01T00:00:00.000+00:00")
       }
@@ -163,14 +163,14 @@ db.visualizacoes.aggregate([
       from: "assinantes",
       localField: "assinanteId",
       foreignField: "_id",
-      as: "assinantes"
+      as: "infoAssinante"
     }
   },
   {
     $group: {
-      _id: "$assinantes.plano",
+      _id: "$infoAssinante.plano",
       minutosTotais: { $sum: "$minutosAssistidos" },
-      assinantesDistintos: { $sum: "$assinanteId" }
+      assinantesDistintos: { $addToSet: "$infoAssinante._id" }
     }
   },
   { $sort: { minutosTotais: -1 } },
@@ -180,7 +180,7 @@ db.visualizacoes.aggregate([
       _id: 0,
       plano: "$_id",
       minutosTotais: 1,
-      assinantesDistintos: 1
+      assinantesDistintos: {$size: "$assinantesDistintos"}
     }
   }
 ])
@@ -196,6 +196,25 @@ Classifique cada visualização: `"Maratona"` (120 min ou mais), `"Normal"` (de 
 
 **Resposta:**
 
+```javascript
+db.visualizacoes.aggregate([
+  {$addFields: {
+    classificacao: {
+      $switch: {
+        branches: [
+          {case: {$gte: ["$minutosAssistidos", 120]}, then: "Maratona"},
+        	{case: {$gte: ["$minutosAssistidos", 45]}, then: "Normal"}
+        ],
+        default: "Abandono"
+      }
+    }
+  }},
+  {$group: {_id: "$classificacao", qtd: {$sum: 1}, somaMin: {$sum: "$minutosAssistidos"}}},
+  {$sort: {qtd: -1}},
+  {$project: {_id: 0, classificacao: "$_id", qtd: 1, somaMin: 1}}
+])
+```
+
 ---
 
 ## Questão 6 — Faixas de duração
@@ -205,6 +224,26 @@ Classifique cada visualização: `"Maratona"` (120 min ou mais), `"Normal"` (de 
 Distribua os títulos nas faixas de `duracaoMin`: `[0,90)`, `[90,120)`, `[120,140)` e `"140 ou mais"` (use o bucket padrão com esse nome). Para cada faixa retorne `qtd`, `notaMedia` (2 casas) e o array `titulos` com os nomes.
 
 **Resposta:**
+
+```javascript
+db.titulos.aggregate([
+  {$bucket: {
+    groupBy: "$duracaoMin",
+    boundaries: [0, 90, 120, 140],
+    default: "140 ou mais",
+    output: {
+      qtd: {$sum: 1},
+      notaMedia: {$avg: "$notaImdb"},
+      arrayTitulos: {$addToSet: "$titulo"}
+    }
+  }},
+  {$sort: {_id: -1}},
+  {$project: {_id: 0, faixa: "$_id", qtd: 1,
+              notaMedia: {$round: ["$notaMedia", 2]},
+             	arrayTitulos: 1
+             }}
+])
+```
 
 ---
 
@@ -216,6 +255,16 @@ Calcule o total de minutos assistidos por mês, no formato `"AAAA-MM"`. Retorne 
 
 **Resposta:**
 
+```javascript
+db.visualizacoes.aggregate([
+  {$group: {_id: {$dateToString: {format: "%Y-%m", date: "$dataHora"}},
+           	minAssistidos: {$sum: "$minutosAssistidos"}
+           }},
+  {$sort: {_id: 1}},
+  {$project: {_id: 0, data: "$_id", minAssistidos: 1}}
+])
+```
+
 ---
 
 ## Questão 8 — Elenco principal
@@ -226,6 +275,19 @@ Para cada título, extraia o array `principais` com os nomes dos atores de papel
 
 **Resposta:**
 
+```javascript
+db.titulos.aggregate([
+  {$unwind: "$elenco"},
+  {$match: {"elenco.papel": "principal"}},
+  {$group: {_id: "$titulo",
+           	principais: {$push: "$elenco.nome"},
+            qtdPrincipais: {$sum: 1}
+           }},
+  {$match: {qtdPrincipais: {$gte: 2}}},
+  {$sort: {qtdPrincipais: -1, _id: 1}},
+  {$project: {_id: 0, titulo: "$_id", principais: 1, qtdPrincipais: 1}}
+])
+```
 ---
 
 ## Questão 9 — Painel executivo (uma única consulta)
@@ -240,6 +302,30 @@ Com um único `aggregate` em `visualizacoes`, retorne um documento com três cha
 
 **Resposta:**
 
+```javascript
+db.visualizacoes.aggregate([
+  {$facet: {
+    porDispositivo: [
+      {$group: {_id: "$dispositivo", qtd: {$sum: 1}}},
+      {$sort: {qtd: -1, _id: 1}}
+    ],
+    top3Titulos: [
+      {$group: {_id: "$tituloId", minutos: {$sum: "$minutosAssistidos"}}},
+      {$sort: {minutos: -1, _id: 1}},
+      {$limit: 3}
+    ],
+    resumo: [
+      {$group: {_id: null, totalVisualizacoes: {$sum: 1},
+               	minutosTotais: {$sum: "$minutosAssistidos"},
+                mediaMinutos: {$avg: "$minutosAssistidos"}
+               }},
+      {$project: {_id: 0, totalVisualizacoes: 1, minutosTotais: 1,
+                 	mediaMinutos: {$round: ["$mediaMinutos", 1]}
+                 }}
+    ]
+  }}
+])
+```
 ---
 
 ## Questão 10 — Ranking com acumulado
@@ -250,3 +336,50 @@ Some os minutos por `tituloId` e gere um ranking decrescente (desempate por `_id
 
 **Resposta:**
 
+```javascript
+db.visualizacoes.aggregate([
+  {
+    $group: {
+      _id: "$tituloId",
+      minutos: { $sum: "$minutosAssistidos" }
+    }
+  },
+  {
+    $sort: {
+      minutos: -1,
+      _id: 1
+    }
+  },
+  {
+    $setWindowFields: {
+      sortBy: {
+        minutos: -1,
+        _id: 1
+      },
+      output: {
+        posicao: {
+          $documentNumber: {}
+        },
+        acumulado: {
+          $sum: "$minutos",
+          window: {
+            documents: ["unbounded", "current"]
+          }
+        }
+      }
+    }
+  },
+  {
+    $limit: 5
+  },
+  {
+    $project: {
+      _id: 0,
+      tituloId: "$_id",
+      minutos: 1,
+      posicao: 1,
+      acumulado: 1
+    }
+  }
+])
+```
